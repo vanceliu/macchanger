@@ -1,148 +1,159 @@
 #!/bin/bash
+# macchanger.sh - Change macOS network interface MAC address (macOS 15 / 26)
 
-VERSION="0.2.0"
-AUTHOR="shilch (updated by ChatGPT)"
-YEAR="2025"
+VERSION="0.3.0_mac26"
+MAX_ROUNDS=5          # Wi-Fi off/on retry rounds
+WINDOW_TRIES=40       # attempts per round, 0.1s apart
 
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-YELLOW='\033[0;33m'
-RS='\033[0m'
-
-BOLD=$(tput bold)
-NORMAL=$(tput sgr0)
-
+RED='\033[0;31m'; BLUE='\033[0;34m'; YELLOW='\033[0;33m'; GREEN='\033[0;32m'; RS='\033[0m'
+BOLD=$(tput bold 2>/dev/null); NORMAL=$(tput sgr0 2>/dev/null)
 ERROR="${BOLD}${RED}ERROR:${RS}${NORMAL}   "
 INFO="${BOLD}${BLUE}INFO:${RS}${NORMAL}    "
 WARNING="${BOLD}${YELLOW}WARNING:${RS}${NORMAL} "
+OK="${BOLD}${GREEN}OK:${RS}${NORMAL}      "
 
-if [[ "$(uname)" != "Darwin" ]]; then
-  printf "${ERROR}This script only works on macOS.\n"
-  exit 1
-fi
+die() { printf "%b%s\n" "$ERROR" "$1"; exit 1; }
+info() { printf "%b%s\n" "$INFO" "$1"; }
+warn() { printf "%b%s\n" "$WARNING" "$1"; }
 
-if [[ $EUID -ne 0 ]]; then
-  printf "${ERROR}Use as root: sudo $0 [option] [device]\n"
-  exit 1
-fi
+[[ "$(uname)" == "Darwin" ]] || die "This script only runs on macOS."
 
-ensureDeviceExists () {
-  if ! ifconfig "$1" > /dev/null 2>&1; then
-    printf "${ERROR}Device/interface not found. Maybe it's down?\n"
-    exit 1
-  fi
+ensureDeviceExists() {
+  [[ -n "$1" ]] || die "Specify a device (e.g. en0). List devices with: networksetup -listallhardwareports"
+  ifconfig "$1" >/dev/null 2>&1 || die "Device $1 not found."
 }
 
-getType(){
-  networksetup -listallhardwareports | \
-  awk -v iface="$1" '
-    $1=="Hardware" && $2=="Port:" {port=$3}
-    $1=="Device:" && $2==iface {print port}
-  '
+ensureRoot() {
+  [[ $EUID -eq 0 ]] || die "Run as root: sudo bash $0 $*"
 }
 
+# Returns the Hardware Port name
+getType() {
+  networksetup -listallhardwareports | awk -v iface="$1" '
+    /^Hardware Port:/ { sub(/^Hardware Port: /, ""); port=$0 }
+    /^Device:/ && $2==iface { print port; exit }'
+}
+
+isWifi() { [[ "$(getType "$1")" == "Wi-Fi" ]]; }
+
+currentMac() { ifconfig "$1" 2>/dev/null | awk '/ether/{print tolower($2); exit}'; }
+
+getPermanent() { networksetup -getmacaddress "$1" 2>/dev/null | awk '{print tolower($3)}'; }
+
+normalizeMac() {
+  local m
+  m=$(printf "%s" "$1" | tr 'A-F-' 'a-f:')
+  [[ "$m" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || return 1
+  printf "%s" "$m"
+}
+
+# Locally administered, unicast
 generateMac() {
-  openssl rand -hex 6 | sed 's/\(..\)/\1:/g; s/:$//' | awk '{print tolower($0)}'
+  local hex first
+  hex=$(openssl rand -hex 6)
+  first=$(( (16#${hex:0:2} & 0xFC) | 0x02 ))
+  printf "%02x:%s:%s:%s:%s:%s" "$first" "${hex:2:2}" "${hex:4:2}" "${hex:6:2}" "${hex:8:2}" "${hex:10:2}"
 }
 
-currentMac () {
-  ifconfig "$1" | awk '/ether/{print $2}'
+warnMulticast() {
+  local first=$((16#${1:0:2}))
+  (( first % 2 == 0 )) || warn "This is a multicast address (odd first byte); setting it usually fails."
 }
 
-getPermanent (){
-  networksetup -getmacaddress "$1" 2>/dev/null | awk '{print $3}'
+# Must be set after Wi-Fi restarts, before it auto-joins a network
+setMacWifi() {
+  local iface=$1 mac=$2 round try
+  for (( round=1; round<=MAX_ROUNDS; round++ )); do
+    info "Round $round/$MAX_ROUNDS: restarting Wi-Fi and setting MAC..."
+    networksetup -setairportpower "$iface" off
+    sleep 1
+    networksetup -setairportpower "$iface" on
+    for (( try=1; try<=WINDOW_TRIES; try++ )); do
+      ifconfig "$iface" ether "$mac" 2>/dev/null
+      if [[ "$(currentMac "$iface")" == "$mac" ]]; then
+        networksetup -detectnewhardware 2>/dev/null
+        return 0
+      fi
+      sleep 0.1
+    done
+  done
+  return 1
 }
 
-setMac(){
-  local iface=$1
-  local newmac=$2
-
-  printf "${INFO}Disabling interface $iface...\n"
-  ifconfig "$iface" down
-
-  printf "${INFO}Setting new MAC: $newmac\n"
-  ifconfig "$iface" ether "$newmac"
-
-  printf "${INFO}Enabling interface $iface...\n"
-  ifconfig "$iface" up
+# Interface must be up
+setMacWired() {
+  local iface=$1 mac=$2
+  ifconfig "$iface" ether "$mac" 2>/dev/null
+  [[ "$(currentMac "$iface")" == "$mac" ]] && return 0
+  ifconfig "$iface" down; ifconfig "$iface" ether "$mac" 2>/dev/null; ifconfig "$iface" up
+  [[ "$(currentMac "$iface")" == "$mac" ]]
 }
 
-warnMulticast(){
-  local firstbyte=$(echo "$1" | cut -d: -f1)
-  local dec=$((16#$firstbyte))
-  if (( dec % 2 != 0 )); then
-    printf "${WARNING}MAC address is multicast! Might not work properly.\n"
+setMac() {
+  local iface=$1 mac=$2 old
+  old=$(currentMac "$iface")
+  [[ -n "$old" ]] || die "$iface has no configurable MAC address."
+  warnMulticast "$mac"
+
+  if [[ "$old" == "$mac" ]]; then
+    info "MAC is already $mac; nothing to change."
+  elif isWifi "$iface"; then
+    if ! setMacWifi "$iface" "$mac"; then
+      printf "%b%s\n" "$ERROR" "Failed to set Wi-Fi MAC (Wi-Fi reconnected too fast, or the driver rejected the address)."
+      echo "  Manual fallback: Option-click the Wi-Fi menu bar icon -> Disconnect, then immediately run:"
+      echo "    sudo ifconfig $iface ether $mac"
+      exit 1
+    fi
+  else
+    setMacWired "$iface" "$mac" || die "This driver does not support changing the MAC (common with USB / Thunderbolt Ethernet adapters)."
+  fi
+
+  printf "%b%s\n" "$OK" "MAC changed"
+  printf "${BOLD}Permanent MAC address:${NORMAL} %s\n" "$(getPermanent "$iface")"
+  printf "${BOLD}Old MAC address:${NORMAL}       %s\n" "$old"
+  printf "${BOLD}New MAC address:${NORMAL}       %s\n" "$(currentMac "$iface")"
+  if isWifi "$iface"; then
+    echo
+    warn "Reconnect to Wi-Fi manually. If the network's Private Wi-Fi Address is not Off, macOS may replace this MAC on reconnect"
+    echo "         (System Settings -> Wi-Fi -> Details... -> Private Wi-Fi Address -> Off). The MAC resets after reboot."
   fi
 }
 
-if [[ "$1" == "-v" || "$1" == "--version" ]]; then
-  printf "Version: $VERSION, Copyright $YEAR by $AUTHOR\n"
+usage() {
+  cat <<USAGE
+Usage: sudo bash $0 [option] [device]
+Options:
+  -m, --mac MAC DEV    Set a specific MAC, e.g. sudo bash $0 -m a4:cf:99:64:9c:de en0
+  -r, --random DEV     Set a random MAC (locally administered, unicast)
+  -p, --permanent DEV  Restore the permanent (hardware) MAC
+  -s, --show DEV       Show current / permanent MAC
+  -v, --version        Show version
+USAGE
+}
 
-elif [[ "$1" == "-s" || "$1" == "--show" ]]; then
-  if [[ -z "$2" ]]; then
-    printf "${ERROR}Please specify your device / interface\n"
-    exit 1
-  fi
-  ensureDeviceExists "$2"
-
-  printf "${BOLD}Type of device:${NORMAL}         $( getType "$2" )\n"
-  printf "${BOLD}Permanent MAC address:${NORMAL}  $( getPermanent "$2" )\n"
-  printf "${BOLD}Current MAC address:${NORMAL}    $( currentMac "$2" )\n"
-
-elif [[ "$1" == "-r" || "$1" == "--random" ]]; then
-  if [[ -z "$2" ]]; then
-    printf "${ERROR}Please specify your device / interface\n"
-    exit 1
-  fi
-  ensureDeviceExists "$2"
-
-  oldmac=$( currentMac "$2" )
-  newmac=$( generateMac )
-
-  warnMulticast "$newmac"
-  setMac "$2" "$newmac"
-
-  printf "${BOLD}Permanent MAC address:${NORMAL} $( getPermanent "$2" )\n"
-  printf "${BOLD}Old MAC address:${NORMAL}       $oldmac\n"
-  printf "${BOLD}New MAC address:${NORMAL}       $( currentMac "$2" )\n"
-
-elif [[ "$1" == "-m" || "$1" == "--mac" ]]; then
-  if [[ -z "$2" || -z "$3" ]]; then
-    printf "${ERROR}Usage: -m MAC device\n"
-    exit 1
-  fi
-  warnMulticast "$2"
-  ensureDeviceExists "$3"
-
-  oldmac=$( currentMac "$3" )
-  setMac "$3" "$2"
-
-  printf "${BOLD}Permanent MAC address:${NORMAL} $( getPermanent "$3" )\n"
-  printf "${BOLD}Old MAC address:${NORMAL}       $oldmac\n"
-  printf "${BOLD}New MAC address:${NORMAL}       $( currentMac "$3" )\n"
-
-elif [[ "$1" == "-p" || "$1" == "--permanent" ]]; then
-  if [[ -z "$2" ]]; then
-    printf "${ERROR}Please specify your device / interface\n"
-    exit 1
-  fi
-  ensureDeviceExists "$2"
-
-  oldmac=$( currentMac "$2" )
-  permac=$( getPermanent "$2" )
-
-  setMac "$2" "$permac"
-
-  printf "${BOLD}Permanent MAC address:${NORMAL} $permac\n"
-  printf "${BOLD}Old MAC address:${NORMAL}       $oldmac\n"
-  printf "${BOLD}New MAC address:${NORMAL}       $( currentMac "$2" )\n"
-
-else
-  printf "Usage: sudo $0 [option] [device]\n"
-  printf "Options:\n"
-  printf " -r, --random         Generates a random MAC and sets it\n"
-  printf " -m, --mac MAC        Set a custom MAC address\n"
-  printf " -p, --permanent      Reset to permanent MAC address\n"
-  printf " -s, --show           Show current & permanent MAC\n"
-  printf " -v, --version        Show version\n"
-fi
+case "$1" in
+  -v|--version)
+    echo "macchanger3 version $VERSION (for macOS 15 / 26)" ;;
+  -s|--show)
+    ensureDeviceExists "$2"
+    printf "${BOLD}Type of device:${NORMAL}         %s\n" "$(getType "$2")"
+    printf "${BOLD}Permanent MAC address:${NORMAL}  %s\n" "$(getPermanent "$2")"
+    printf "${BOLD}Current MAC address:${NORMAL}    %s\n" "$(currentMac "$2")" ;;
+  -m|--mac)
+    ensureRoot "$@"
+    MAC=$(normalizeMac "$2") || die "Invalid MAC: $2 (expected aa:bb:cc:dd:ee:ff)"
+    ensureDeviceExists "$3"
+    setMac "$3" "$MAC" ;;
+  -r|--random)
+    ensureRoot "$@"
+    ensureDeviceExists "$2"
+    setMac "$2" "$(generateMac)" ;;
+  -p|--permanent)
+    ensureRoot "$@"
+    ensureDeviceExists "$2"
+    PERM=$(getPermanent "$2")
+    PERM=$(normalizeMac "$PERM") || die "Could not read the permanent MAC of $2."
+    setMac "$2" "$PERM" ;;
+  *)
+    usage ;;
+esac
